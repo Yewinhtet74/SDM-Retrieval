@@ -353,8 +353,7 @@ so it does not run with this code. Use `03_eval_reducers.py` instead.
 ## 8. Credits and license
 
 This project builds on [MRL-Retrieval](https://github.com/Azathoth2001/MRL-Retrieval)
-by Azathoth2001, released under the MIT License (see `LICENSE`). The previous README is
-kept as `README_old.md`.
+by Azathoth2001, released under the MIT License (see `LICENSE`).
 
 CLIP models are loaded with [OpenCLIP](https://github.com/mlfoundations/open_clip).
 Flickr30k is downloaded from the Hugging Face dataset `nlphuji/flickr30k`; check the
