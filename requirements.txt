@@ -1,15 +1,14 @@
-# torch/torchvision 不在这里列 —— 请按自己的 CUDA 版本从官方 index 单独装，例如：
-#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-open_clip_torch
-faiss-cpu
-numpy
-scikit-learn
-pandas
-matplotlib
-tqdm
-pyyaml
-huggingface_hub          # 取数据（scripts/00_fetch_data.py）；数据落盘后运行期不再需要
-pillow
+# Exact versions used for all results (Python 3.12, recorded by scripts/00_check_env.py).
+# torch and torchvision are installed separately, before this file (README section 2.2):
+#   pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124
 
-# 注：Phase 2 的 LoRA 是手写的（src/lora.py），**不需要 peft** ——
-# OpenCLIP 的 q/k/v 融合在 nn.MultiheadAttention 的裸 in_proj_weight 里，peft 挂不到那个位点。
+open_clip_torch==3.3.0
+faiss-cpu==1.15.1
+numpy==2.5.2
+scikit-learn==1.9.1
+pandas==3.0.6
+matplotlib==3.11.2
+tqdm==4.70.1
+pyyaml==6.0.3
+huggingface_hub==2.2.0   # used by scripts/00_fetch_data.py to download Flickr30k
+pillow==12.3.0

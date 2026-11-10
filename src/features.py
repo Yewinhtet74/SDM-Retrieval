@@ -1,11 +1,26 @@
-"""特征：抽取并缓存冻结 CLIP 的 512 维 embedding（.npy）及加载接口。★地基★。单一职责：特征缓存。
+"""Features: extract and cache frozen CLIP 512-dimensional embeddings (.npy)
+and provide loading interfaces. ★ FOUNDATION ★
+Single responsibility: feature caching.
 
-约定：存**原始未归一化 fp32**（归一化留到用的时候做，否则前缀截断的顺序会被写死）；
-图/文分开存 + id 对齐表；已存在则跳过。
-.npy 为唯一真源。之后 PCA / adapter 训练 / 四组评测全在缓存上跑。
+Convention: store **raw, unnormalized fp32** embeddings
+(normalization is applied when needed; otherwise prefix truncation order
+would be fixed prematurely).
+
+Image/text features are stored separately with aligned ID tables.
+If a feature file already exists, extraction is skipped.
+
+Each model gets its own cache folder, outputs/features/{model}/, where {model}
+is cfg.model.name + cfg.model.pretrained (e.g. ViT-B-32_openai), so features
+from different encoders can never be mixed up. A model.json in each folder
+records which model produced the files; load_features refuses a folder whose
+model.json does not match the config.
+
+.npy is the single source of truth. All subsequent PCA / adapter training /
+four-group evaluation runs operate on these cached features.
 """
 from __future__ import annotations
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -20,147 +35,453 @@ COCO_PREFIX = "coco_"
 
 
 def _resolve_splits(cfg, splits):
-    """按 split 名分派数据集：`coco_*` -> MS-COCO，其余 -> Flickr30k。
+    """Dispatch datasets based on split names:
+    `coco_*` -> MS-COCO, everything else -> Flickr30k.
 
-    这样 `load_features(cfg, "coco_restval", "image")` 与 Flickr30k 的调用方式完全一致，
-    上层（evaluate / cascade）不必知道特征来自哪个数据集。
+    This allows `load_features(cfg, "coco_restval", "image")`
+    to use exactly the same interface as Flickr30k.
+
+    Higher-level modules such as evaluate / cascade do not need to know
+    which dataset the features come from.
     """
     flickr = [s for s in splits if not s.startswith(COCO_PREFIX)]
     coco = [s[len(COCO_PREFIX):] for s in splits if s.startswith(COCO_PREFIX)]
+
     out = {}
+
     if flickr:
-        out.update({k: v for k, v in get_splits(cfg).items() if k in flickr})
+        out.update({
+            k: v
+            for k, v in get_splits(cfg).items()
+            if k in flickr
+        })
+
     if coco:
-        out.update({COCO_PREFIX + k: v for k, v in get_coco_splits(cfg, coco).items()})
+        out.update({
+            COCO_PREFIX + k: v
+            for k, v in get_coco_splits(cfg, coco).items()
+        })
+
     return out
 
 
+def model_tag(cfg) -> str:
+    """File-name-safe model id, e.g. 'ViT-B-32_openai' or
+    'ViT-B-32_laion2b_s34b_b79k' (cfg.model.name + cfg.model.pretrained;
+    characters like '/' or '@' become '-'). Used for the feature folder and as
+    the prefix of result files."""
+    name = getattr(cfg.model, "name", "model")
+    pretrained = getattr(cfg.model, "pretrained", None)
+    tag = f"{name}_{pretrained}" if pretrained else str(name)
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", tag)
+
+
+def _feature_root(cfg) -> Path:
+    return Path(cfg.paths.output_root) / "features"
+
+
 def _feature_dir(cfg) -> Path:
-    d = Path(cfg.paths.output_root) / "features"
+    """Return the feature cache directory of the configured model:
+    outputs/features/{model}/"""
+    d = _feature_root(cfg) / model_tag(cfg)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
 
+feature_dir = _feature_dir  # public name
+
+
+def _model_desc(cfg) -> str:
+    return f"{getattr(cfg.model, 'name', '?')} / {getattr(cfg.model, 'pretrained', '?')}"
+
+
+def _check_model_json(cfg, d: Path):
+    """Raise if the folder's model.json says it holds another model's features."""
+    meta = d / "model.json"
+    if not meta.exists():
+        return
+    m = json.loads(meta.read_text(encoding="utf-8"))
+    want = (getattr(cfg.model, "name", None), getattr(cfg.model, "pretrained", None))
+    if (m.get("name"), m.get("pretrained")) != want:
+        raise RuntimeError(
+            f"{d} holds features of {m.get('name')} / {m.get('pretrained')}, "
+            f"but the config says {want[0]} / {want[1]}."
+        )
+
+
 def _paths(cfg, split, modality):
+    """Return the paths for an embedding .npy file and its ID JSON file."""
     d = _feature_dir(cfg)
-    return d / f"{split}_{modality}.npy", d / f"{split}_{modality}_ids.json"
+    return (
+        d / f"{split}_{modality}.npy",
+        d / f"{split}_{modality}_ids.json"
+    )
 
 
 def _image_input_dtype(model):
-    """图像 tensor 首先撞上的那层权重的 dtype —— preprocess 产出 fp32，不匹配就 RuntimeError。
+    """Determine the dtype expected by the first layer of the visual encoder.
 
-    坑：open_clip 的 precision='fp16' 产出的是**混合精度**模型，不是整体 half。实测 3.3.0：
-      positional_embedding fp32 / logit_scale fp32 / visual.conv1.weight **fp16**
-    所以 next(model.parameters()).dtype（拿到的是 positional_embedding）会误报 fp32。
-    这里取 visual 里第一个 Conv/Linear 的权重 dtype —— ViT 是 conv1，timm 骨干是 patch_embed.proj。
+    The image preprocessing pipeline outputs fp32 tensors. If the model uses
+    mixed precision, passing fp32 directly may cause a dtype mismatch.
+
+    Important: open_clip with precision='fp16' uses a **mixed-precision model**,
+    not a model where every parameter is fp16.
+
+    For example, in open_clip 3.3.0:
+      positional_embedding -> fp32
+      logit_scale          -> fp32
+      visual.conv1.weight  -> fp16
+
+    Therefore, `next(model.parameters()).dtype` can incorrectly report fp32.
+
+    Instead, find the first Conv/Linear layer inside `model.visual`.
+    For ViT this is usually `conv1`; for timm backbones it is typically
+    `patch_embed.proj`.
     """
     for m in model.visual.modules():
-        if isinstance(m, (torch.nn.Conv2d, torch.nn.Conv3d, torch.nn.Linear)):
+        if isinstance(
+            m,
+            (torch.nn.Conv2d, torch.nn.Conv3d, torch.nn.Linear)
+        ):
             w = getattr(m, "weight", None)
             if w is not None:
                 return w.dtype
+
     return next(model.visual.parameters()).dtype
 
 
 @torch.no_grad()
-def _encode_loader(loader, ids, model, modality, device, img_dtype, desc):
-    """跑一遍 loader，拼出 [N, dim] fp32 未归一化特征。顺序 == ids 顺序（loader shuffle=False）。"""
+def _encode_loader(
+    loader,
+    ids,
+    model,
+    modality,
+    device,
+    img_dtype,
+    desc
+):
+    """Run one complete DataLoader pass and produce [N, dim] fp32
+    unnormalized features.
+
+    The feature order is exactly the same as the ID order because
+    the loader uses shuffle=False.
+    """
     out = []
+
     for batch in tqdm(loader, desc=desc, unit="batch"):
         batch = batch.to(device, non_blocking=True)
+
         if modality == "image":
-            emb = encode(model, images=batch.to(img_dtype))
+            emb = encode(
+                model,
+                images=batch.to(img_dtype)
+            )
         else:
-            emb = encode(model, texts=batch)          # token 是整型，交给 embedding 层，不能转
-        out.append(emb.float().cpu().numpy())
+            # Tokens are integer tensors and must be passed directly
+            # to the embedding layer.
+            emb = encode(
+                model,
+                texts=batch
+            )
+
+        out.append(
+            emb.float().cpu().numpy()
+        )
+
     emb = np.concatenate(out, axis=0).astype(np.float32)
+
     if len(emb) != len(ids):
-        raise RuntimeError(f"{desc}: 特征 {len(emb)} 条 != id {len(ids)} 条，对齐已坏")
+        raise RuntimeError(
+            f"{desc}: {len(emb)} features != {len(ids)} IDs; "
+            "feature/ID alignment is broken"
+        )
+
     return emb
 
 
-def extract_and_cache(cfg, splits=("train", "val", "test"), modalities=MODALITIES,
-                      overwrite=False):
-    """对指定 split 的图与文跑一遍冻结 CLIP，缓存 512 维 fp32 到 outputs/features/。
+def extract_and_cache(
+    cfg,
+    splits=("train", "val", "test"),
+    modalities=MODALITIES,
+    overwrite=False
+):
+    """Extract frozen CLIP features for the specified splits/modalities.
 
-    `modalities` 可只要 image —— 纯干扰池（如 coco_restval）用不到 caption，
-    抽 15 万条文本纯属浪费。
+    Features are cached as raw fp32 embeddings in:
+        outputs/features/{model}/
+
+    `modalities` can contain only ``image`` when text features are unnecessary,
+    such as for the COCO restval interference gallery.
+    Extracting tens of thousands of unused captions would otherwise waste time.
     """
     from .model import load_clip
 
-    todo = [(s, m) for s in splits for m in modalities
-            if overwrite or not _paths(cfg, s, m)[0].exists()]
+    d = _feature_dir(cfg)
+    print(f"Model: {_model_desc(cfg)}   feature folder: {d}")
+
+    todo = [
+        (s, m)
+        for s in splits
+        for m in modalities
+        if overwrite or not _paths(cfg, s, m)[0].exists()
+    ]
+
     if not todo:
-        print("特征已全部缓存，跳过。删 outputs/features/ 或 overwrite=True 可重抽。")
+        print(
+            f"All features for this model are already cached in {d}. "
+            "Skipping extraction. Delete that folder or use overwrite=True "
+            "to re-extract."
+        )
         return {}
 
-    print(f"待抽取：{[f'{s}/{m}' for s, m in todo]}")
-    all_splits = _resolve_splits(cfg, sorted({s for s, _ in todo}))
+    print(
+        f"Features to extract: "
+        f"{[f'{s}/{m}' for s, m in todo]}"
+    )
+
+    all_splits = _resolve_splits(
+        cfg,
+        sorted({s for s, _ in todo})
+    )
+
     model, preprocess, tokenizer = load_clip(cfg)
+
     device = cfg.model.device
     img_dtype = _image_input_dtype(model)
-    print(f"图像输入 dtype = {img_dtype}（precision={cfg.model.precision}）")
+
+    print(
+        f"Image input dtype = {img_dtype} "
+        f"(precision={cfg.model.precision})"
+    )
 
     done = {}
+
     for split, modality in todo:
         records = all_splits[split]
-        loader, ids = build_extract_loader(cfg, records, modality,
-                                          preprocess=preprocess, tokenizer=tokenizer)
-        emb = _encode_loader(loader, ids, model, modality, device, img_dtype,
-                             desc=f"{split}/{modality}")
-        emb_path, ids_path = _paths(cfg, split, modality)
+
+        loader, ids = build_extract_loader(
+            cfg,
+            records,
+            modality,
+            preprocess=preprocess,
+            tokenizer=tokenizer
+        )
+
+        emb = _encode_loader(
+            loader,
+            ids,
+            model,
+            modality,
+            device,
+            img_dtype,
+            desc=f"{split}/{modality}"
+        )
+
+        emb_path, ids_path = _paths(
+            cfg,
+            split,
+            modality
+        )
+
         np.save(emb_path, emb)
-        ids_path.write_text(json.dumps(ids), encoding="utf-8")
-        print(f"  {emb_path.name}  {emb.shape}  {emb.nbytes / 1e6:.1f} MB")
+
+        ids_path.write_text(
+            json.dumps(ids),
+            encoding="utf-8"
+        )
+
+        print(
+            f"  {emb_path}  "
+            f"{emb.shape}  "
+            f"{emb.nbytes / 1e6:.1f} MB"
+        )
+
         done[(split, modality)] = emb.shape
+
+    # Record which model produced the files in this folder
+    (d / "model.json").write_text(json.dumps({
+        "name": getattr(cfg.model, "name", None),
+        "pretrained": getattr(cfg.model, "pretrained", None),
+        "precision": getattr(cfg.model, "precision", None),
+        "dim": int(emb.shape[1]),
+    }, indent=2), encoding="utf-8")
+
     return done
 
 
 def load_features(cfg, split, modality):
-    """加载缓存。modality in {'image','text'}。返回 (emb[N,512] float32 未归一化, ids[N])。"""
+    """Load cached features.
+
+    Parameters
+    ----------
+    split : str
+        Dataset split name, e.g. ``train``, ``val``, ``test``,
+        ``coco_test``, or ``coco_restval``.
+
+    modality : str
+        Either ``image`` or ``text``.
+
+    Returns
+    -------
+    emb : np.ndarray
+        Shape [N, 512], float32, unnormalized embeddings.
+
+    ids : list
+        IDs aligned with the embedding rows.
+    """
     if modality not in MODALITIES:
-        raise ValueError(f"modality 只能是 image/text，收到 {modality!r}")
-    emb_path, ids_path = _paths(cfg, split, modality)
+        raise ValueError(
+            f"modality must be image/text, got {modality!r}"
+        )
+
+    emb_path, ids_path = _paths(
+        cfg,
+        split,
+        modality
+    )
+
     if not emb_path.exists():
-        raise FileNotFoundError(f"缺特征缓存 {emb_path}，先跑：python scripts/02_extract_features.py")
+        hint = ""
+        legacy = _feature_root(cfg) / emb_path.name
+        if legacy.exists():
+            hint = (
+                f" There is an older cache directly in {legacy.parent} (made "
+                "before model folders, so its model is not recorded). If it "
+                f"came from {_model_desc(cfg)}, move those files into "
+                f"{emb_path.parent}; otherwise re-extract."
+            )
+        raise FileNotFoundError(
+            f"Missing feature cache {emb_path} for {_model_desc(cfg)}. "
+            "Run: python scripts/02_extract_features.py." + hint
+        )
+    _check_model_json(cfg, emb_path.parent)
+
     emb = np.load(emb_path).astype(np.float32)
-    ids = json.loads(ids_path.read_text(encoding="utf-8"))
+
+    ids = json.loads(
+        ids_path.read_text(
+            encoding="utf-8"
+        )
+    )
+
     return emb, ids
 
 
 def load_gallery(cfg, splits=("train", "val", "test")):
-    """拼出 ~31k 全量图库（测延迟/存储用：1000 图太小，任何维度都亚毫秒、看不出差异）。
-    返回 (emb[N,512] fp32, ids[N])。
+    """Build the full ~31k-image gallery.
 
-    ⚠️ 含 29,000 张 adapter 训练过的 train 图 —— 做**召回**的跨组比较时不能用这个图库，
-    见 RESULTS.md §5 的测量注意；干净图库用 `load_clean_gallery`。
+    This gallery is used for latency/storage measurements.
+    A 1,000-image gallery is too small: latency at every dimension
+    would be sub-millisecond and dimension-dependent differences
+    would be difficult to observe.
+
+    Returns
+    -------
+    emb : np.ndarray
+        Shape [N, 512], fp32.
+
+    ids : list
+        Image IDs.
+
+    WARNING
+    -------
+    This gallery contains 29,000 training images that were seen by
+    the adapter during training.
+
+    Therefore, this gallery should NOT be used for cross-condition
+    recall comparisons.
+
+    See RESULTS.md §5 for the measurement caveat.
+    Use `load_clean_gallery()` for a clean gallery.
     """
     embs, ids = [], []
+
     for s in splits:
-        e, i = load_features(cfg, s, "image")
+        e, i = load_features(
+            cfg,
+            s,
+            "image"
+        )
+
         embs.append(e)
         ids.extend(i)
+
     return np.concatenate(embs, axis=0), ids
 
 
 def load_clean_gallery(cfg, kind="same_domain"):
-    """**干净**图库：不含任何 adapter 训练过的图。返回 (emb[N,512] fp32, ids[N])。
+    """Build a **clean** gallery containing no adapter-training images.
 
-    kind:
-      same_domain  —— test 1,000 + Flickr30k train 的留出集（同域，规模小但分布一致）
-      cross_domain —— test 1,000 + COCO restval 30,504（规模大，但存在分布偏移：
-                      COCO 偏物体中心、Flickr30k 偏人物动作，异域干扰项可能更容易被排除）
-    两种都报才知道结论稳不稳。
+    Returns
+    -------
+    emb : np.ndarray
+        Shape [N, 512], fp32.
+
+    ids : list
+        Image IDs.
+
+    Parameters
+    ----------
+    kind : str
+        ``same_domain``
+            Test 1,000 + held-out Flickr30k training images.
+            Same domain, smaller gallery, distributionally consistent.
+
+        ``cross_domain``
+            Test 1,000 + COCO restval 30,504.
+            Large gallery, but contains domain shift.
+
+            COCO tends to be object-centered, whereas Flickr30k contains
+            more people/action-oriented images. Cross-domain distractors
+            may therefore be easier to reject.
+
+    Both should be reported so that conclusions are not dependent
+    on a particular gallery construction.
     """
     from .data import train_holdout_indices
 
-    te, te_ids = load_features(cfg, "test", "image")
+    te, te_ids = load_features(
+        cfg,
+        "test",
+        "image"
+    )
+
     if kind == "same_domain":
-        tr, tr_ids = load_features(cfg, "train", "image")
-        _, held = train_holdout_indices(len(tr_ids), cfg.data.holdout_train)
-        return (np.concatenate([te, tr[held]], axis=0),
-                list(te_ids) + [tr_ids[i] for i in held])
+        tr, tr_ids = load_features(
+            cfg,
+            "train",
+            "image"
+        )
+
+        _, held = train_holdout_indices(
+            len(tr_ids),
+            cfg.data.holdout_train
+        )
+
+        return (
+            np.concatenate(
+                [te, tr[held]],
+                axis=0
+            ),
+            list(te_ids)
+            + [tr_ids[i] for i in held]
+        )
+
     if kind == "cross_domain":
-        co, co_ids = load_features(cfg, "coco_restval", "image")
-        return np.concatenate([te, co], axis=0), list(te_ids) + list(co_ids)
-    raise ValueError(f"kind 只能是 same_domain/cross_domain，收到 {kind!r}")
+        co, co_ids = load_features(
+            cfg,
+            "coco_restval",
+            "image"
+        )
+
+        return (
+            np.concatenate(
+                [te, co],
+                axis=0
+            ),
+            list(te_ids) + list(co_ids)
+        )
+
+    raise ValueError(
+        f"kind must be same_domain/cross_domain, got {kind!r}"
+    )

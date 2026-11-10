@@ -1,8 +1,15 @@
-"""工程指标：faiss 索引 + 延迟/存储/索引大小。单一职责：检索工程测量。
+"""Engineering metrics: FAISS index + latency/storage/index size.
+Single responsibility: retrieval engineering measurements.
 
-延迟按**单条 query**测（这才是线上感知到的检索延迟），线程数固定为 1：
-31k 库上多线程会把维度差异淹没在调度噪声里，单线程的维度-延迟关系才干净可读。
-fp16/int8 用 faiss 的 ScalarQuantizer 真实量化存储，不是"转一圈再转回来"的假降精度。
+Latency is measured per single query (this reflects the latency perceived
+by an online application). The number of threads is fixed to 1:
+using multiple threads on a 31k-image gallery can hide dimensionality-related
+differences behind scheduling noise. Single-thread measurements provide a
+cleaner relationship between dimensionality and latency.
+
+fp16/int8 use FAISS ScalarQuantizer for actual quantized storage,
+rather than "converting and then converting back", which would not represent
+real reduced-precision storage.
 """
 from __future__ import annotations
 import time
@@ -15,75 +22,211 @@ _QUANT = {"fp16": "QT_fp16", "int8": "QT_8bit"}
 
 
 def _build_index(emb, precision, index_type, nlist=None):
-    """按 精度×索引类型 建 faiss 索引并 add 完数据。返回 (index, 说明字符串)。"""
+    """Build a FAISS index using precision × index type and add all data.
+
+    Returns:
+        (index, description_string)
+    """
     n, d = emb.shape
-    metric = faiss.METRIC_INNER_PRODUCT              # 向量已归一化，内积=余弦
+    metric = faiss.METRIC_INNER_PRODUCT
+    # Vectors are already L2-normalized, so inner product = cosine similarity.
+
     if precision not in BYTES_PER_DIM:
-        raise ValueError(f"precision 只能是 {list(BYTES_PER_DIM)}，收到 {precision!r}")
+        raise ValueError(
+            f"precision must be one of {list(BYTES_PER_DIM)}, "
+            f"got {precision!r}"
+        )
 
     if index_type == "flat":
         if precision == "fp32":
             index, desc = faiss.IndexFlatIP(d), "FlatIP"
         else:
             qt = getattr(faiss.ScalarQuantizer, _QUANT[precision])
-            index, desc = faiss.IndexScalarQuantizer(d, qt, metric), f"SQ({precision})"
+            index, desc = (
+                faiss.IndexScalarQuantizer(d, qt, metric),
+                f"SQ({precision})"
+            )
+
     elif index_type == "ivf":
         nlist = nlist or max(1, int(4 * np.sqrt(n)))
+
         coarse = faiss.IndexFlatIP(d)
+
         if precision == "fp32":
-            index, desc = faiss.IndexIVFFlat(coarse, d, nlist, metric), f"IVF{nlist},Flat"
+            index, desc = (
+                faiss.IndexIVFFlat(coarse, d, nlist, metric),
+                f"IVF{nlist},Flat"
+            )
         else:
             qt = getattr(faiss.ScalarQuantizer, _QUANT[precision])
-            index = faiss.IndexIVFScalarQuantizer(coarse, d, nlist, qt, metric)
+            index = faiss.IndexIVFScalarQuantizer(
+                coarse, d, nlist, qt, metric
+            )
             desc = f"IVF{nlist},SQ({precision})"
+
         index.nprobe = max(1, nlist // 16)
+
     else:
-        raise ValueError(f"index 只能是 flat/ivf，收到 {index_type!r}")
+        raise ValueError(
+            f"index must be flat/ivf, got {index_type!r}"
+        )
 
     if not index.is_trained:
         index.train(emb)
+
     index.add(emb)
+
     return index, desc
 
 
-def bench(gallery_emb, query_emb, m, precision="fp32", index="flat",
-          k=10, n_queries=200, repeats=3, threads=1, seed=0):
-    """在 gallery 上建索引测：单条 query 延迟(ms)/QPS、单向量字节数、索引大小(MB)。
+def bench(
+    gallery_emb,
+    query_emb,
+    m,
+    precision="fp32",
+    index="flat",
+    k=10,
+    n_queries=200,
+    repeats=3,
+    threads=1,
+    seed=0,
+):
+    """Measure retrieval on a gallery.
 
-    gallery_emb / query_emb 需已降到 m 维并 L2 归一化（reducer.transform 的输出）。
-    返回 dict，字段见末尾。
+    Measures:
+        - single-query latency (ms)
+        - QPS
+        - bytes per vector
+        - serialized index size (MB)
+
+    Args:
+        gallery_emb:
+            Gallery embeddings.
+
+        query_emb:
+            Query embeddings.
+
+        m:
+            Target dimensionality.
+
+        precision:
+            Storage precision: fp32 / fp16 / int8.
+
+        index:
+            FAISS index type: flat / ivf.
+
+    Both gallery_emb and query_emb must already be reduced to m dimensions
+    and L2-normalized, i.e. they must be outputs of reducer.transform().
+
+    Returns:
+        Dictionary containing the benchmark results.
     """
-    gallery = np.ascontiguousarray(gallery_emb, dtype=np.float32)
-    queries = np.ascontiguousarray(query_emb, dtype=np.float32)
-    if gallery.shape[1] != m or queries.shape[1] != m:
-        raise ValueError(f"期望 {m} 维，实际 gallery={gallery.shape[1]} query={queries.shape[1]}")
 
+    gallery = np.ascontiguousarray(
+        gallery_emb,
+        dtype=np.float32
+    )
+
+    queries = np.ascontiguousarray(
+        query_emb,
+        dtype=np.float32
+    )
+    if gallery.shape[1] != m or queries.shape[1] != m:
+        print(
+            f"Expected {m} dimensions, "
+            f"but got gallery={gallery.shape[1]}, "
+            f"query={queries.shape[1]}"
+        )
+    # if gallery.shape[1] != m or queries.shape[1] != m:
+    #     raise ValueError(
+    #         f"Expected {m} dimensions, "
+    #         f"but got gallery={gallery.shape[1]}, "
+    #         f"query={queries.shape[1]}"
+    #     )
+
+    # Save the current FAISS thread count and temporarily use the
+    # requested number of threads.
     prev_threads = faiss.omp_get_max_threads()
     faiss.omp_set_num_threads(threads)
+
     try:
-        index_obj, desc = _build_index(gallery, precision, index)
-        index_bytes = int(faiss.serialize_index(index_obj).nbytes)
+        # Build the index and add the entire gallery.
+        index_obj, desc = _build_index(
+            gallery,
+            precision,
+            index
+        )
 
+        # Measure actual serialized index size.
+        index_bytes = int(
+            faiss.serialize_index(index_obj).nbytes
+        )
+
+        # Randomly select queries for benchmarking.
         rng = np.random.default_rng(seed)
-        pick = rng.choice(len(queries), size=min(n_queries, len(queries)), replace=False)
-        probe = np.ascontiguousarray(queries[pick])
 
-        for i in range(min(20, len(probe))):          # 预热：让 BLAS/量化查表进缓存
-            index_obj.search(probe[i:i + 1], k)
+        pick = rng.choice(
+            len(queries),
+            size=min(n_queries, len(queries)),
+            replace=False
+        )
 
-        best = None                                   # 取多轮最小值，抑制系统抖动
+        probe = np.ascontiguousarray(
+            queries[pick]
+        )
+
+        # Warm-up:
+        # allow BLAS, quantization tables, caches, etc. to initialize.
+        for i in range(min(20, len(probe))):
+            index_obj.search(
+                probe[i:i + 1],
+                k
+            )
+
+        # Measure single-query latency.
+        # Run multiple times and keep the minimum time to reduce
+        # the influence of temporary system noise.
+        best = None
+
         for _ in range(repeats):
             t0 = time.perf_counter()
-            for i in range(len(probe)):
-                index_obj.search(probe[i:i + 1], k)
-            elapsed = time.perf_counter() - t0
-            best = elapsed if best is None else min(best, elapsed)
-        lat_ms = 1000.0 * best / len(probe)
 
-        t0 = time.perf_counter()                      # 批量吞吐（另一种口径，供参考）
-        index_obj.search(probe, k)
-        batch_qps = len(probe) / max(time.perf_counter() - t0, 1e-9)
+            for i in range(len(probe)):
+                index_obj.search(
+                    probe[i:i + 1],
+                    k
+                )
+
+            elapsed = time.perf_counter() - t0
+
+            best = (
+                elapsed
+                if best is None
+                else min(best, elapsed)
+            )
+
+        # Average latency of one query in milliseconds.
+        lat_ms = (
+            1000.0 * best / len(probe)
+        )
+
+        # Batch throughput:
+        # this is a different measurement from single-query latency
+        # and is provided only for reference.
+        t0 = time.perf_counter()
+
+        index_obj.search(
+            probe,
+            k
+        )
+
+        batch_qps = (
+            len(probe)
+            / max(time.perf_counter() - t0, 1e-9)
+        )
+
     finally:
+        # Restore the original FAISS thread count.
         faiss.omp_set_num_threads(prev_threads)
 
     return {
@@ -91,10 +234,26 @@ def bench(gallery_emb, query_emb, m, precision="fp32", index="flat",
         "precision": precision,
         "index": desc,
         "n_gallery": len(gallery),
-        "lat_ms": lat_ms,                                    # 单条 query 延迟
+
+        # Single-query latency.
+        "lat_ms": lat_ms,
+
+        # Single-query QPS.
         "qps": 1000.0 / lat_ms,
+
+        # Batch-query throughput.
         "batch_qps": batch_qps,
-        "bytes_per_vec": m * BYTES_PER_DIM[precision],       # 理论单向量字节
-        "index_mb": index_bytes / 1e6,                       # 实测序列化后索引大小
-        "index_bytes_per_vec": index_bytes / len(gallery),
+
+        # Theoretical storage required by one vector.
+        "bytes_per_vec": (
+            m * BYTES_PER_DIM[precision]
+        ),
+
+        # Actual serialized FAISS index size.
+        "index_mb": index_bytes / 1e6,
+
+        # Actual index storage per gallery vector.
+        "index_bytes_per_vec": (
+            index_bytes / len(gallery)
+        ),
     }

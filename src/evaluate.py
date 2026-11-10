@@ -1,18 +1,25 @@
-"""评测编排：给定一个 reducer，跑遍各维度 -> 质量(metrics)+工程(retrieval) -> 汇总结果表。单一职责：编排评测。
+"""Evaluation orchestration: given a reducer, evaluate all dimensions -> quality (metrics)
++ engineering (retrieval) -> aggregate results into a result table. Single responsibility:
+evaluation orchestration.
 
-四组（truncate / pca / adapter_plain / adapter_mrl）走的是**同一段代码**，
-唯一差别是传进来的 reducer —— 这样"MRL 赢了"不可能是评测路径不同带来的假象。
+Four groups (truncate / pca / adapter_plain / adapter_mrl) use the **same code path**.
+The only difference is the reducer passed in — this prevents the claim that "MRL wins"
+from being an artifact of different evaluation paths.
 
-质量在 1000 图 test 上算（与文献可比）；延迟/存储在 31k 全量图库上测（1000 张太小，各维度都亚毫秒）。
+Quality is measured on the 1,000-image test set (comparable with the literature);
+latency/storage are measured on the full 31k-image gallery (1,000 images are too small,
+so latency at every dimension would be sub-millisecond).
 """
 from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
 
-from .features import load_features, load_gallery
-from .metrics import recall_at_k
+from .features import load_features, load_gallery, model_tag  # model_tag re-exported
+from .metrics import recall_at_k, _owner_index
 from .retrieval import bench
+
+import numpy as np
 
 
 def _results_dir(cfg) -> Path:
@@ -21,64 +28,192 @@ def _results_dir(cfg) -> Path:
     return d
 
 
-def evaluate_condition(cfg, reducer, name, split="test", with_bench=True):
-    """对 cfg.mrl.dims 每个 m 评一遍，汇总成表并存 outputs/results/{name}.csv。
+def _result_path(cfg, stem) -> Path:
+    """outputs/results/{model}_{stem}.csv"""
+    return _results_dir(cfg) / f"{model_tag(cfg)}_{stem}.csv"
 
-    行 = 维度；列 = 双向 R@1/5/10 + 相对满维的保持率 + 各精度的延迟/存储。
+
+
+def evaluate_condition(cfg, reducer, name, split="test", data_size=None, with_bench=True):
+    """Evaluate each m in cfg.mrl.dims, aggregate results, and save to
+    outputs/results/{model}_{name}_{data_size}.csv
+    (e.g. ViT-B-32_openai_pca_l2_1000.csv; the model also goes in a "model" column).
+
+    Rows = dimensions;
+    columns = bidirectional R@1/5/10 + retention relative to full dimension
+    + latency/storage for each precision.
     """
     img, img_ids = load_features(cfg, split, "image")
     txt, txt_ids = load_features(cfg, split, "text")
     gallery, _ = load_gallery(cfg) if with_bench else (None, None)
-
+    # print("img_ids:", img_ids[:20])
+    # print("txt_ids:", txt_ids[:30])
+    # print("unique image IDs:", len(np.unique(img_ids)))
+    # print("unique text IDs:", len(np.unique(txt_ids)))
     dims = list(cfg.mrl.dims)
-    print(f"[{name}] {split}: {len(img_ids)} 图 / {len(txt_ids)} caption"
-          + (f"；图库 {len(gallery)} 图" if with_bench else "")
-          + f"；维度 {dims}")
+    tag = model_tag(cfg)
+
+    
+    print(f"[{name}] {split}: {len(img_ids)} images / {len(txt_ids)} captions"
+          + (f"; gallery {len(gallery)} images" if with_bench else "")
+          + f"; dimensions {dims}")
 
     rows = []
     for m in dims:
-        row = {"condition": name, "dim": m}
-        rec = recall_at_k(reducer.transform(img, m), reducer.transform(txt, m),
-                          img_ids, txt_ids, ks=(1, 5, 10))
+        row = {"model": tag, "condition": name, "dim": m}
+
+        # ------------------------------------------------------------
+        # DEBUG: verify image/text feature-ID alignment
+        # ------------------------------------------------------------
+        # print("\n=== RETRIEVAL ALIGNMENT DEBUG ===")
+
+        # owner = _owner_index(img_ids, txt_ids)
+
+        # print("img shape:", img.shape)
+        # print("txt shape:", txt.shape)
+
+        # print("first image IDs:")
+        # for i in range(min(10, len(img_ids))):
+        #     print(i, img_ids[i])
+
+        # print("\nfirst text IDs:")
+        # for i in range(min(15, len(txt_ids))):
+        #     print(i, txt_ids[i], "owner =", owner[i])
+
+        # # Check caption grouping
+        # unique_owner, counts = np.unique(owner, return_counts=True)
+        # print("\ncaption count per image:")
+        # print("min =", counts.min())
+        # print("max =", counts.max())
+        # print("mean =", counts.mean())
+        # print("images with != 5 captions =", np.sum(counts != 5))
+
+        # # ------------------------------------------------------------
+        # # Check whether the correct image/caption pairs have high score
+        # # ------------------------------------------------------------
+        # img_full = reducer.transform(img, max(dims))
+        # txt_full = reducer.transform(txt, max(dims))
+
+        # sim = img_full @ txt_full.T
+
+        # print("\nCorrect-pair similarity sanity check:")
+
+        # correct_scores = []
+
+        # for i in range(min(10, len(img_ids))):
+        #     caption_idx = np.where(owner == i)[0]
+        #     scores = sim[i, caption_idx]
+
+        #     correct_scores.extend(scores.tolist())
+
+        #     print(
+        #         f"image {i} ({img_ids[i]}): "
+        #         f"correct captions = {caption_idx.tolist()}, "
+        #         f"scores = {scores.tolist()}, "
+        #         f"best rank = {1 + np.sum(sim[i] > scores.max())}"
+        #     )
+
+        # print(
+        #     "\ncorrect-pair score:",
+        #     np.mean(correct_scores),
+        #     "min:",
+        #     np.min(correct_scores),
+        #     "max:",
+        #     np.max(correct_scores),
+        # )
+
+        # print("global similarity:",
+        #     sim.min(), sim.mean(), sim.max())
+
+        # print("=== END DEBUG ===\n")
+        rec = recall_at_k(
+            reducer.transform(img, m),
+            reducer.transform(txt, m),
+            img_ids,
+            txt_ids,
+            ks=(1, 5, 10)
+        )
+
         for d in ("i2t", "t2i"):
             for k in (1, 5, 10):
                 row[f"{d}_r{k}"] = rec[d][k]
 
         if with_bench:
-            # query = caption（text→image 检索，图库是 31k 张图），与 t2i 方向一致
+            # query = caption (text-to-image retrieval), gallery = 31k images,
+            # matching the t2i direction.
             gal_m, q_m = reducer.transform(gallery, m), reducer.transform(txt, m)
+
             for prec in cfg.eval.precisions:
-                b = bench(gal_m, q_m, m, precision=prec, index=cfg.eval.faiss_index)
+                b = bench(
+                    gal_m,
+                    q_m,
+                    m,
+                    precision=prec,
+                    index=cfg.eval.faiss_index
+                )
                 row[f"lat_ms_{prec}"] = b["lat_ms"]
                 row[f"bytes_{prec}"] = b["bytes_per_vec"]
                 row[f"index_mb_{prec}"] = b["index_mb"]
+
             row["n_gallery"] = b["n_gallery"]
 
         rows.append(row)
-        print(f"  m={m:>4}  i2t R@1={row['i2t_r1']:6.2f}  t2i R@1={row['t2i_r1']:6.2f}"
-              + (f"  lat={row[f'lat_ms_{cfg.eval.precisions[0]}']:6.3f}ms" if with_bench else ""))
+
+        print(
+            f"  m={m:>4}  "
+            f"i2t R@1={row['i2t_r1']:6.2f}  "
+            f"t2i R@1={row['t2i_r1']:6.2f}"
+            + (
+                f"  lat={row[f'lat_ms_{cfg.eval.precisions[0]}']:6.3f}ms"
+                if with_bench else ""
+            )
+        )
 
     df = pd.DataFrame(rows)
-    full = max(dims)                                  # 相对满维的保持率 —— 头牌指标
+
+    full = max(dims)
+
+    # Retention relative to the full dimension — the headline metric.
     for col in ("i2t_r1", "t2i_r1"):
         base = df.loc[df["dim"] == full, col].iloc[0]
-        df[f"{col}_ret"] = 100.0 * df[col] / base if base else float("nan")
+        df[f"{col}_ret"] = (
+            100.0 * df[col] / base
+            if base
+            else float("nan")
+        )
 
-    out = _results_dir(cfg) / f"{name}.csv"
+    out = _result_path(cfg, f"{name}_{data_size}")
     df.to_csv(out, index=False, encoding="utf-8")
+
     print(f"  -> {out}")
     return df
 
 
 def load_condition_results(cfg, names):
-    """读回若干组的结果 CSV 并纵向拼起来（05 汇总用）。缺的组跳过并提示。"""
+    """Load the result CSVs for multiple conditions and concatenate them
+    vertically (used by 05_summary).
+
+    `names` are condition + training size WITHOUT the model prefix, e.g.
+    ["baseline_None", "pca_l2_1000", "svd_l2_1000"]; the current config's model
+    prefix is added automatically. Files saved before the prefix existed
+    ("pca_l2_1000.csv") are used as a fallback. Missing groups are skipped
+    with a warning.
+    """
     frames = []
+
     for n in names:
-        p = _results_dir(cfg) / f"{n}.csv"
+        p = _result_path(cfg, n)
+        if not p.exists() and (_results_dir(cfg) / f"{n}.csv").exists():
+            p = _results_dir(cfg) / f"{n}.csv"   # saved before the model prefix
+
         if p.exists():
             frames.append(pd.read_csv(p))
         else:
-            print(f"  (跳过 {n}：{p.name} 不存在)")
+            print(f"  (skip {n}: {p.name} does not exist)")
+
     if not frames:
-        raise FileNotFoundError("一组结果都没有，先跑 03 / 04")
+        raise FileNotFoundError(
+            "No result groups found. Run 03 / 04 first."
+        )
+
     return pd.concat(frames, ignore_index=True)
